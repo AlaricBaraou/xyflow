@@ -8,6 +8,7 @@ import { useOnInitHandler } from '../../hooks/useOnInitHandler';
 import { useViewportSync } from '../../hooks/useViewportSync';
 import { ConnectionLineWrapper } from '../../components/ConnectionLine';
 import { EdgeConfigProvider } from '../../contexts/EdgeConfigContext';
+import { HandleConfigProvider } from '../../contexts/HandleConfigContext';
 import { useNodeOrEdgeTypesWarning } from './useNodeOrEdgeTypesWarning';
 import type { Edge, Node, ReactFlowProps } from '../../types';
 import { useStylesLoadedWarning } from './useStylesLoadedWarning';
@@ -182,22 +183,24 @@ function GraphViewComponent<NodeType extends Node = Node, EdgeType extends Edge 
           containerStyle={connectionLineContainerStyle}
         />
         <div className="react-flow__edgelabel-renderer" />
-        <NodeRenderer<NodeType>
-          nodeTypes={nodeTypes}
-          onNodeClick={onNodeClick}
-          onNodeDoubleClick={onNodeDoubleClick}
-          onNodeMouseEnter={onNodeMouseEnter}
-          onNodeMouseMove={onNodeMouseMove}
-          onNodeMouseLeave={onNodeMouseLeave}
-          onNodeContextMenu={onNodeContextMenu}
-          nodeClickDistance={nodeClickDistance}
-          onlyRenderVisibleElements={onlyRenderVisibleElements}
-          noPanClassName={noPanClassName}
-          noDragClassName={noDragClassName}
-          disableKeyboardA11y={disableKeyboardA11y}
-          nodeExtent={nodeExtent}
-          rfId={rfId}
-        />
+        <HandleConfigProvider>
+          <NodeRenderer<NodeType>
+            nodeTypes={nodeTypes}
+            onNodeClick={onNodeClick}
+            onNodeDoubleClick={onNodeDoubleClick}
+            onNodeMouseEnter={onNodeMouseEnter}
+            onNodeMouseMove={onNodeMouseMove}
+            onNodeMouseLeave={onNodeMouseLeave}
+            onNodeContextMenu={onNodeContextMenu}
+            nodeClickDistance={nodeClickDistance}
+            onlyRenderVisibleElements={onlyRenderVisibleElements}
+            noPanClassName={noPanClassName}
+            noDragClassName={noDragClassName}
+            disableKeyboardA11y={disableKeyboardA11y}
+            nodeExtent={nodeExtent}
+            rfId={rfId}
+          />
+        </HandleConfigProvider>
         <div className="react-flow__viewport-portal" />
       </Viewport>
     </FlowRenderer>

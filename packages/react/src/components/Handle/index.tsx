@@ -4,6 +4,9 @@ import {
   type TouchEvent as ReactTouchEvent,
   type ForwardedRef,
   memo,
+  useCallback,
+  useRef,
+  useSyncExternalStore,
 } from 'react';
 import cc from 'classcat';
 import { shallow } from 'zustand/shallow';
@@ -23,8 +26,9 @@ import {
   Optional,
 } from '@xyflow/system';
 
-import { useStore, useStoreApi } from '../../hooks/useStore';
+import { useStoreApi } from '../../hooks/useStore';
 import { useNodeId } from '../../contexts/NodeIdContext';
+import { useHandleConfig } from '../../contexts/HandleConfigContext';
 import { type ReactFlowState } from '../../types';
 import { fixedForwardRef } from '../../utils';
 import { addEdge } from '../../utils/edges';
@@ -38,31 +42,40 @@ export type HandleProps = HandlePropsSystem &
     onConnect?: OnConnect;
   };
 
-const selector = (s: ReactFlowState) => ({
-  connectOnClick: s.connectOnClick,
-  noPanClassName: s.noPanClassName,
-  rfId: s.rfId,
-});
+type ConnectingState = {
+  connectingFrom: boolean;
+  connectingTo: boolean;
+  clickConnecting: boolean;
+  isPossibleEndHandle: boolean;
+  connectionInProcess: boolean;
+  clickConnectionInProcess: boolean;
+  valid: boolean | null;
+};
 
-const connectingSelector =
-  (nodeId: string | null, handleId: string | null, type: HandleType) => (state: ReactFlowState) => {
-    const { connectionClickStartHandle: clickHandle, connectionMode, connection } = state;
-    const { fromHandle, toHandle, isValid } = connection;
-    const connectingTo = toHandle?.nodeId === nodeId && toHandle?.id === handleId && toHandle?.type === type;
+function computeConnectingState(
+  state: ReactFlowState,
+  nodeId: string | null,
+  handleId: string | null,
+  type: HandleType,
+  connectionMode: ConnectionMode
+): ConnectingState {
+  const { connectionClickStartHandle: clickHandle, connection } = state;
+  const { fromHandle, toHandle, isValid } = connection;
+  const connectingTo = toHandle?.nodeId === nodeId && toHandle?.id === handleId && toHandle?.type === type;
 
-    return {
-      connectingFrom: fromHandle?.nodeId === nodeId && fromHandle?.id === handleId && fromHandle?.type === type,
-      connectingTo,
-      clickConnecting: clickHandle?.nodeId === nodeId && clickHandle?.id === handleId && clickHandle?.type === type,
-      isPossibleEndHandle:
-        connectionMode === ConnectionMode.Strict
-          ? fromHandle?.type !== type
-          : nodeId !== fromHandle?.nodeId || handleId !== fromHandle?.id,
-      connectionInProcess: !!fromHandle,
-      clickConnectionInProcess: !!clickHandle,
-      valid: connectingTo && isValid,
-    };
+  return {
+    connectingFrom: fromHandle?.nodeId === nodeId && fromHandle?.id === handleId && fromHandle?.type === type,
+    connectingTo,
+    clickConnecting: clickHandle?.nodeId === nodeId && clickHandle?.id === handleId && clickHandle?.type === type,
+    isPossibleEndHandle:
+      connectionMode === ConnectionMode.Strict
+        ? fromHandle?.type !== type
+        : nodeId !== fromHandle?.nodeId || handleId !== fromHandle?.id,
+    connectionInProcess: !!fromHandle,
+    clickConnectionInProcess: !!clickHandle,
+    valid: connectingTo && isValid,
   };
+}
 
 function HandleComponent(
   {
@@ -86,7 +99,22 @@ function HandleComponent(
   const isTarget = type === 'target';
   const store = useStoreApi();
   const nodeId = useNodeId();
-  const { connectOnClick, noPanClassName, rfId } = useStore(selector, shallow);
+  // static config from context, no per-handle store subscription
+  const { connectOnClick, noPanClassName, rfId, connectionMode } = useHandleConfig();
+
+  // connection state from a dedicated channel. The old useStore selector re-ran for every handle on
+  // every store emit (each node-drag frame), then shallow-bailed the re-render; this channel fires
+  // only on connection changes, so a node-position write doesn't run the selector at all.
+  const connectingCache = useRef<ConnectingState | null>(null);
+  const getConnectingSnapshot = useCallback(() => {
+    const next = computeConnectingState(store.getState(), nodeId, handleId, type, connectionMode);
+    const prev = connectingCache.current;
+    if (prev && shallow(prev, next)) {
+      return prev;
+    }
+    connectingCache.current = next;
+    return next;
+  }, [store, nodeId, handleId, type, connectionMode]);
   const {
     connectingFrom,
     connectingTo,
@@ -95,7 +123,11 @@ function HandleComponent(
     connectionInProcess,
     clickConnectionInProcess,
     valid,
-  } = useStore(connectingSelector(nodeId, handleId, type), shallow);
+  } = useSyncExternalStore(
+    useCallback((onChange) => store.getState().subscribeConnection(onChange), [store]),
+    getConnectingSnapshot,
+    getConnectingSnapshot
+  );
   if (!nodeId) {
     store.getState().onError?.('010', errorMessages['error010']());
   }
@@ -180,7 +212,7 @@ function HandleComponent(
 
     if (!connectionClickStartHandle) {
       onClickConnectStart?.(event.nativeEvent, { nodeId, handleId, handleType: type });
-      store.setState({ connectionClickStartHandle: { nodeId, type, id: handleId } });
+      store.getState().setConnectionClickStartHandle({ nodeId, type, id: handleId });
       return;
     }
 
@@ -212,7 +244,7 @@ function HandleComponent(
     connectionClone.toPosition = connectionClone.toHandle ? connectionClone.toHandle.position : null;
     onClickConnectEnd?.(event as unknown as MouseEvent, connectionClone as FinalConnectionState);
 
-    store.setState({ connectionClickStartHandle: null });
+    store.getState().setConnectionClickStartHandle(null);
   };
 
   return (

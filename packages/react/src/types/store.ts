@@ -181,6 +181,10 @@ export type ReactFlowActions<NodeType extends Node, EdgeType extends Edge> = {
   setNodeExtent: (nodeExtent: CoordinateExtent) => void;
   cancelConnection: () => void;
   updateConnection: UpdateConnection<InternalNode<NodeType>>;
+  /** Set the click-to-connect start handle and wake the connection channel. */
+  setConnectionClickStartHandle: (
+    handle: (Pick<Handle, 'nodeId' | 'id'> & Required<Pick<Handle, 'type'>>) | null
+  ) => void;
   reset: () => void;
   /** @internal Per-node subscription used by the node renderer; bypasses the
    *  global notify-all fan-out. Paired with getNodeVersion for useSyncExternalStore. */
@@ -202,6 +206,9 @@ export type ReactFlowActions<NodeType extends Node, EdgeType extends Edge> = {
   /** @internal Selection signal: notifies when the set of selected nodes or edges changes.
    *  SelectionListener recomputes the selection from it. */
   subscribeSelection: (listener: () => void) => () => void;
+  /** Subscribe to connection-state changes only (connect gestures), bypassing the global fan-out
+   *  so a node-position write never wakes handles. */
+  subscribeConnection: (listener: () => void) => () => void;
   triggerNodeChanges: (changes: NodeChange<NodeType>[]) => void;
   triggerEdgeChanges: (changes: EdgeChange<EdgeType>[]) => void;
   panBy: PanBy;
