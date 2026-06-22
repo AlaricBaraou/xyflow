@@ -23,6 +23,27 @@ import { applyEdgeChanges, applyNodeChanges, createSelectionChange, getSelection
 import getInitialState from './initialState';
 import type { ReactFlowState, Node, Edge, UnselectNodesAndEdgesParams, FitViewOptions } from '../types';
 
+/*
+ * A notify-only channel for useSyncExternalStore: `subscribe` registers a listener, `notify` fires
+ * them. Used for the coarse "something in this category changed" signals (node list, edge list,
+ * selection); each consumer keeps its own recomputed snapshot and just needs to be told when to
+ * recompute, instead of re-running a global store selector on every emit.
+ */
+function createNotifyChannel() {
+  const listeners = new Set<() => void>();
+  return {
+    subscribe(listener: () => void) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    notify() {
+      for (const listener of listeners) listener();
+    },
+  };
+}
+
 const createStore = ({
   nodes,
   edges,
@@ -254,6 +275,20 @@ const createStore = ({
       return edgeVersions.get(id) ?? 0;
     }
 
+    /*
+     * Coarse structural / selection signals. The renderers read the visible id list through the
+     * node/edge list channels (bumped only when the id set or order changes, not on a position
+     * drag), and SelectionListener reads selection through the selection channel. selectedNodeIds /
+     * selectedEdgeIds are the store's own copy of the selected set, so setNodes / setEdges can diff
+     * the incoming array against them and detect a selection change even though the user passes a
+     * fresh array each time (and even if a node is mutated in place).
+     */
+    const nodesList = createNotifyChannel();
+    const edgesList = createNotifyChannel();
+    const selection = createNotifyChannel();
+    const selectedNodeIds = new Set<string>();
+    const selectedEdgeIds = new Set<string>();
+
     async function resolveFitView() {
       const { nodeLookup, panZoom, fitViewOptions, fitViewResolver, width, height, minZoom, maxZoom } = get();
 
@@ -346,27 +381,80 @@ const createStore = ({
         // full path) may have moved culled nodes in its parent cascade, so flag it and let visible
         // edges to those nodes still re-path under onlyRenderVisibleElements.
         notifyNodes(changedIds, true);
+
+        // a full adopt (changedIds === undefined) means the id set or order changed, so bump the
+        // node-list version to recompute the rendered id list; a position-only drag takes the
+        // incremental path (changedIds defined) and bumps nothing.
+        if (changedIds === undefined) {
+          nodesList.notify();
+        }
+
+        /*
+         * Selection: diff the incoming array against the store's own selected set. A node is newly
+         * selected if it is selected now but was not in the set; a count mismatch catches deselects
+         * and removed-while-selected. No allocation unless selection actually changed, so a
+         * position-only drag walks the array and bumps nothing.
+         */
+        let newSelectedNodeCount = 0;
+        let nodeSelectionChanged = false;
+        for (const userNode of nodes) {
+          if (userNode.selected) {
+            newSelectedNodeCount++;
+            if (!selectedNodeIds.has(userNode.id)) {
+              nodeSelectionChanged = true;
+            }
+          }
+        }
+        if (newSelectedNodeCount !== selectedNodeIds.size) {
+          nodeSelectionChanged = true;
+        }
+        if (nodeSelectionChanged) {
+          selectedNodeIds.clear();
+          for (const userNode of nodes) {
+            if (userNode.selected) {
+              selectedNodeIds.add(userNode.id);
+            }
+          }
+          selection.notify();
+        }
       },
       setEdges: (edges: Edge[]) => {
         const { connectionLookup, edgeLookup } = get();
 
         /*
-         * Diff the incoming edges against the still-current edgeLookup (before updateConnectionLookup
-         * rebuilds it) to collect the ones whose object changed, then wake the per-edge channel for
-         * them after the rebuild. EdgeWrapper reads its edge through that channel (subscribeEdge)
-         * instead of a global useStore selector that re-ran for every edge on every store emit (e.g.
-         * each node-drag frame). Only done when an edge is subscribed; setEdges is not the node-drag
-         * hot path, so the O(E) scan is fine.
+         * Single pre-rebuild pass over the incoming edges (edgeLookup still holds the old edges in
+         * their old order, before updateConnectionLookup rebuilds it): wake the per-edge channel for
+         * edges whose object changed (EdgeWrapper reads its edge through that channel, not a global
+         * selector), detect an id set / order change for the edge-list version, and diff selection
+         * against the store's own selected-edge set. Edge array order is the SVG paint order, so a
+         * reorder of the same id set must bump the list to repaint (nodes get this from the full
+         * adopt; edges have no such fallback). setEdges is not the node-drag hot path, so the O(E)
+         * scan is fine.
          */
-        let changedEdgeIds: string[] | null = null;
-        if (edgeListeners.size > 0) {
-          changedEdgeIds = [];
-          for (const edge of edges) {
-            const prev = edgeLookup.get(edge.id);
-            if (prev !== undefined && prev !== edge) {
-              changedEdgeIds.push(edge.id);
+        const changedEdgeIds: string[] | null = edgeListeners.size > 0 ? [] : null;
+        const oldEdgeKeys = edgeLookup.keys();
+        let edgeListChanged = edges.length !== edgeLookup.size;
+        let newSelectedEdgeCount = 0;
+        let edgeSelectionChanged = false;
+        for (const edge of edges) {
+          const prev = edgeLookup.get(edge.id);
+          if (prev === undefined) {
+            edgeListChanged = true; // added
+          } else if (prev !== edge && changedEdgeIds) {
+            changedEdgeIds.push(edge.id);
+          }
+          if (!edgeListChanged && oldEdgeKeys.next().value !== edge.id) {
+            edgeListChanged = true; // reorder (same id set, new paint order)
+          }
+          if (edge.selected) {
+            newSelectedEdgeCount++;
+            if (!selectedEdgeIds.has(edge.id)) {
+              edgeSelectionChanged = true;
             }
           }
+        }
+        if (newSelectedEdgeCount !== selectedEdgeIds.size) {
+          edgeSelectionChanged = true;
         }
 
         updateConnectionLookup(connectionLookup, edgeLookup, edges);
@@ -378,6 +466,18 @@ const createStore = ({
           for (const id of changedEdgeIds) {
             notifyEdge(id);
           }
+        }
+        if (edgeListChanged) {
+          edgesList.notify();
+        }
+        if (edgeSelectionChanged) {
+          selectedEdgeIds.clear();
+          for (const edge of edges) {
+            if (edge.selected) {
+              selectedEdgeIds.add(edge.id);
+            }
+          }
+          selection.notify();
         }
       },
       setDefaultNodesAndEdges: (nodes?: Node[], edges?: Edge[]) => {
@@ -688,17 +788,28 @@ const createStore = ({
       },
 
       reset: () => {
-        // clear the per-node/edge prev + incident maps so the next notify re-detects against the
-        // fresh graph instead of dead node references (versions stay monotonic on purpose)
+        // clear the per-node/edge prev + incident maps and the selected-id sets so the next notify /
+        // diff re-detects against the fresh graph instead of dead references (versions stay monotonic
+        // on purpose)
         incidentEdges.clear();
         prevNodeRef.clear();
         prevIsParent.clear();
+        selectedNodeIds.clear();
+        selectedEdgeIds.clear();
         set({ ...getInitialState() });
+        // wake the list + selection channels so their consumers (the renderers, SelectionListener)
+        // re-read the now-empty graph; they no longer ride the global emit
+        nodesList.notify();
+        edgesList.notify();
+        selection.notify();
       },
       subscribeNode,
       getNodeVersion,
       subscribeEdge,
       getEdgeVersion,
+      subscribeNodesList: nodesList.subscribe,
+      subscribeEdgesList: edgesList.subscribe,
+      subscribeSelection: selection.subscribe,
     };
   }, Object.is);
 
