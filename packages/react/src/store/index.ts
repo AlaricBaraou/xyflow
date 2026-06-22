@@ -53,6 +53,23 @@ const createStore = ({
   zIndexMode?: ZIndexMode;
 }) =>
   createWithEqualityFn<ReactFlowState>((set, get) => {
+    /*
+     * Connection channel: connection state changes only during connect gestures, never on a
+     * node-position write, so handles subscribe here instead of a global useStore selector and a
+     * node drag doesn't wake them. Notified by updateConnection / cancelConnection /
+     * setConnectionClickStartHandle / reset.
+     */
+    const connectionListeners = new Set<() => void>();
+    function notifyConnection() {
+      for (const l of connectionListeners) l();
+    }
+    function subscribeConnection(listener: () => void) {
+      connectionListeners.add(listener);
+      return () => {
+        connectionListeners.delete(listener);
+      };
+    }
+
     async function resolveFitView() {
       const { nodeLookup, panZoom, fitViewOptions, fitViewResolver, width, height, minZoom, maxZoom } = get();
 
@@ -442,12 +459,22 @@ const createStore = ({
         set({
           connection: { ...initialConnection },
         });
+        notifyConnection();
       },
       updateConnection: (connection) => {
         set({ connection });
+        notifyConnection();
+      },
+      setConnectionClickStartHandle: (connectionClickStartHandle) => {
+        set({ connectionClickStartHandle });
+        notifyConnection();
       },
 
-      reset: () => set({ ...getInitialState() }),
+      reset: () => {
+        set({ ...getInitialState() });
+        notifyConnection();
+      },
+      subscribeConnection,
     };
   }, Object.is);
 
