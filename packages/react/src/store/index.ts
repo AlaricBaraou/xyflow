@@ -45,6 +45,74 @@ function createNotifyChannel() {
   };
 }
 
+/*
+ * A keyed notify channel for useSyncExternalStore: one independent version per id, so changing one
+ * id wakes only that id's subscribers instead of re-running every subscriber on a global emit. This
+ * is the per-node and per-edge registry. `subscribe(id)` registers and garbage-collects the id when
+ * its last listener leaves; `notify(id)` bumps that id's version and fires its listeners; `getVersion(id)`
+ * is the snapshot the subscriber reads. `onFirstSubscribe` / `onLastUnsubscribe` let the node channel
+ * keep its change-detection bookkeeping (previous ref + parent status) in lockstep with subscriptions.
+ *
+ * Version contract: the version is an opaque change token, not a global clock or a count. It advances
+ * only while the id has subscribers (`notify` is a deliberate no-op otherwise, so an unmounted / culled
+ * id never advances and never leaks a stale version), and it resets to 0 once the id is
+ * garbage-collected. That reset is safe: useSyncExternalStore re-reads `getVersion` when a component
+ * (re)subscribes and reconciles against its last snapshot. Do not "fix" the no-op or persist versions
+ * past GC; both are load-bearing.
+ */
+function createKeyedChannel(hooks?: {
+  onFirstSubscribe?: (id: string) => void;
+  onLastUnsubscribe?: (id: string) => void;
+}) {
+  const listeners = new Map<string, Set<() => void>>();
+  const versions = new Map<string, number>();
+
+  return {
+    subscribe(id: string, listener: () => void) {
+      let set = listeners.get(id);
+      if (!set) {
+        set = new Set();
+        listeners.set(id, set);
+        if (!versions.has(id)) versions.set(id, 0);
+        hooks?.onFirstSubscribe?.(id);
+      }
+      set.add(listener);
+      return () => {
+        const current = listeners.get(id);
+        if (current) {
+          current.delete(listener);
+          if (current.size === 0) {
+            listeners.delete(id);
+            versions.delete(id);
+            hooks?.onLastUnsubscribe?.(id);
+          }
+        }
+      };
+    },
+    notify(id: string) {
+      const set = listeners.get(id);
+      if (!set || set.size === 0) {
+        return;
+      }
+      versions.set(id, (versions.get(id) ?? 0) + 1);
+      for (const l of set) l();
+    },
+    getVersion(id: string) {
+      return versions.get(id) ?? 0;
+    },
+    has(id: string) {
+      return listeners.has(id);
+    },
+    // live key iterator (no array alloc on the scan path); iterate-only, do not mutate during iteration
+    keys() {
+      return listeners.keys();
+    },
+    get size() {
+      return listeners.size;
+    },
+  };
+}
+
 const createStore = ({
   nodes,
   edges,
@@ -85,51 +153,31 @@ const createStore = ({
      * (`parentLookup.has(id)`) flips. The parent-status part matters because a child gaining or
      * losing `parentId` does not change the parent's own reference, so a plain ref check misses it.
      */
-    const nodeListeners = new Map<string, Set<() => void>>();
-    const nodeVersions = new Map<string, number>();
     const prevNodeRef = new Map<string, unknown>();
     const prevIsParent = new Map<string, boolean>();
+    const nodeChannel = createKeyedChannel({
+      // record the current values when an id is first subscribed so the first notify doesn't fire
+      // spuriously, and drop them when its last subscriber leaves
+      onFirstSubscribe: (id) => {
+        const { nodeLookup, parentLookup } = get();
+        prevNodeRef.set(id, nodeLookup.get(id));
+        prevIsParent.set(id, parentLookup.has(id));
+      },
+      onLastUnsubscribe: (id) => {
+        prevNodeRef.delete(id);
+        prevIsParent.delete(id);
+      },
+    });
 
     function notifyNode(id: string) {
       const { nodeLookup, parentLookup } = get();
       prevNodeRef.set(id, nodeLookup.get(id));
       prevIsParent.set(id, parentLookup.has(id));
-      nodeVersions.set(id, (nodeVersions.get(id) ?? 0) + 1);
-      const listeners = nodeListeners.get(id);
-      if (listeners) {
-        for (const l of listeners) l();
-      }
+      nodeChannel.notify(id);
     }
 
-    function subscribeNode(id: string, listener: () => void) {
-      let listeners = nodeListeners.get(id);
-      if (!listeners) {
-        listeners = new Set();
-        nodeListeners.set(id, listeners);
-        // record the current values in the prev maps so the first notify doesn't fire spuriously
-        const { nodeLookup, parentLookup } = get();
-        prevNodeRef.set(id, nodeLookup.get(id));
-        prevIsParent.set(id, parentLookup.has(id));
-        if (!nodeVersions.has(id)) nodeVersions.set(id, 0);
-      }
-      listeners.add(listener);
-      return () => {
-        const listenerSet = nodeListeners.get(id);
-        if (listenerSet) {
-          listenerSet.delete(listener);
-          if (listenerSet.size === 0) {
-            nodeListeners.delete(id);
-            nodeVersions.delete(id);
-            prevNodeRef.delete(id);
-            prevIsParent.delete(id);
-          }
-        }
-      };
-    }
-
-    function getNodeVersion(id: string) {
-      return nodeVersions.get(id) ?? 0;
-    }
+    const subscribeNode = nodeChannel.subscribe;
+    const getNodeVersion = nodeChannel.getVersion;
 
     /*
      * `mayMoveCulledNodes`: the caller took a full-rebuild path that can move nodes the per-node
@@ -142,9 +190,9 @@ const createStore = ({
       // O(changed): the caller (incremental adopt / delta write) listed exactly
       // which nodes changed and guarantees no parent-status flips.
       if (changedIds) {
-        if (nodeListeners.size > 0) {
+        if (nodeChannel.size > 0) {
           for (const id of changedIds) {
-            if (nodeListeners.has(id)) notifyNode(id);
+            if (nodeChannel.has(id)) notifyNode(id);
           }
         }
         notifyIncidentEdges(changedIds);
@@ -157,13 +205,13 @@ const createStore = ({
       // node measure must not re-render every edge. Removed ids go to the edge
       // notify (so a dangling edge hides) but never to notifyNode: their NodeWrapper
       // is unmounting and useNode would dereference a missing nodeLookup entry.
-      if (nodeListeners.size === 0) {
+      if (nodeChannel.size === 0) {
         notifyIncidentEdges();
         return;
       }
       const { nodeLookup, parentLookup } = get();
       const changedForEdges: string[] = [];
-      for (const id of nodeListeners.keys()) {
+      for (const id of nodeChannel.keys()) {
         const node = nodeLookup.get(id);
         if (node === undefined) {
           changedForEdges.push(id);
@@ -181,7 +229,7 @@ const createStore = ({
        * onlyRenderVisibleElements users on a full-rebuild/extent path. Without culling the scan
        * already covers every node, so this is skipped entirely.
        */
-      if (mayMoveCulledNodes && nodeListeners.size < nodeLookup.size) {
+      if (mayMoveCulledNodes && nodeChannel.size < nodeLookup.size) {
         notifyIncidentEdges();
       } else {
         notifyIncidentEdges(changedForEdges);
@@ -199,8 +247,7 @@ const createStore = ({
      * which dedupes by handle pair and would collapse parallel edges (same endpoints
      * and handles) into one entry, missing all but one of them on a node move.
      */
-    const edgeListeners = new Map<string, Set<() => void>>();
-    const edgeVersions = new Map<string, number>();
+    const edgeChannel = createKeyedChannel();
     const incidentEdges = new Map<string, Set<string>>();
 
     function addIncidentEdge(nodeId: string, edgeId: string) {
@@ -220,21 +267,14 @@ const createStore = ({
       }
     }
 
-    function notifyEdge(edgeId: string) {
-      // only bump for a subscribed edge; notifyIncidentEdges fires on incident edges that may be
-      // culled (unmounted) under onlyRenderVisibleElements, and an orphan version entry would leak
-      const listeners = edgeListeners.get(edgeId);
-      if (!listeners) {
-        return;
-      }
-      edgeVersions.set(edgeId, (edgeVersions.get(edgeId) ?? 0) + 1);
-      for (const l of listeners) l();
-    }
+    // notifyIncidentEdges fires on incident edges that may be culled (unmounted) under
+    // onlyRenderVisibleElements; the channel no-ops on an unsubscribed id, so no orphan version leaks
+    const notifyEdge = edgeChannel.notify;
 
     function notifyIncidentEdges(changedNodeIds?: string[]) {
-      if (edgeListeners.size === 0) return;
+      if (edgeChannel.size === 0) return;
       if (!changedNodeIds) {
-        for (const edgeId of edgeListeners.keys()) notifyEdge(edgeId);
+        for (const edgeId of edgeChannel.keys()) notifyEdge(edgeId);
         return;
       }
       // dedupe so an edge spanning two changed nodes (or a parallel pair sharing a
@@ -252,29 +292,8 @@ const createStore = ({
       }
     }
 
-    function subscribeEdge(id: string, listener: () => void) {
-      let listeners = edgeListeners.get(id);
-      if (!listeners) {
-        listeners = new Set();
-        edgeListeners.set(id, listeners);
-        if (!edgeVersions.has(id)) edgeVersions.set(id, 0);
-      }
-      listeners.add(listener);
-      return () => {
-        const listenerSet = edgeListeners.get(id);
-        if (listenerSet) {
-          listenerSet.delete(listener);
-          if (listenerSet.size === 0) {
-            edgeListeners.delete(id);
-            edgeVersions.delete(id);
-          }
-        }
-      };
-    }
-
-    function getEdgeVersion(id: string) {
-      return edgeVersions.get(id) ?? 0;
-    }
+    const subscribeEdge = edgeChannel.subscribe;
+    const getEdgeVersion = edgeChannel.getVersion;
 
     /*
      * Coarse structural / selection signals. The renderers read the visible id list through the
@@ -296,16 +315,10 @@ const createStore = ({
      * node drag doesn't wake them. Notified by updateConnection / cancelConnection /
      * setConnectionClickStartHandle / reset.
      */
-    const connectionListeners = new Set<() => void>();
-    function notifyConnection() {
-      for (const l of connectionListeners) l();
-    }
-    function subscribeConnection(listener: () => void) {
-      connectionListeners.add(listener);
-      return () => {
-        connectionListeners.delete(listener);
-      };
-    }
+    // named distinctly from the `connection` state field (which several actions take as a parameter)
+    const connectionChannel = createNotifyChannel();
+    const notifyConnection = connectionChannel.notify;
+    const subscribeConnection = connectionChannel.subscribe;
 
     async function resolveFitView() {
       const { nodeLookup, panZoom, fitViewOptions, fitViewResolver, width, height, minZoom, maxZoom } = get();
@@ -449,7 +462,7 @@ const createStore = ({
          * adopt; edges have no such fallback). setEdges is not the node-drag hot path, so the O(E)
          * scan is fine.
          */
-        const changedEdgeIds: string[] | null = edgeListeners.size > 0 ? [] : null;
+        const changedEdgeIds: string[] | null = edgeChannel.size > 0 ? [] : null;
         const oldEdgeKeys = edgeLookup.keys();
         let edgeListChanged = edges.length !== edgeLookup.size;
         let newSelectedEdgeCount = 0;
