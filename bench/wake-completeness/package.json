@@ -1,0 +1,23 @@
+{
+  "name": "@xyflow-bench/wake-completeness",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Wake-completeness verifier for the per-entity channels: proves no mutation leaves a subscriber stale. Source-aliased to packages/*/src, so it runs against the live store source.",
+  "scripts": {
+    "dev": "vite --port 4320",
+    "verify": "node drive-wake.cjs"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@types/react": "^18.2.36",
+    "@types/react-dom": "^18.2.14",
+    "@vitejs/plugin-react": "^6.0.2",
+    "typescript": "5.4.5",
+    "vite": "^8.0.12"
+  }
+}
